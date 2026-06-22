@@ -18,7 +18,18 @@ load_dotenv()
 
 UZUM_TOKEN = os.getenv("UZUM_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# Можно указать один ID:
+# TELEGRAM_CHAT_ID=445354240
+# Или несколько ID через запятую:
+# TELEGRAM_CHAT_ID=445354240,938965878
+TELEGRAM_CHAT_IDS = [
+    chat_id.strip()
+    for chat_id in os.getenv("TELEGRAM_CHAT_ID", "").split(",")
+    if chat_id.strip()
+]
+TELEGRAM_CHAT_ID = TELEGRAM_CHAT_IDS[0] if TELEGRAM_CHAT_IDS else ""
+
 UZUM_SHOP_ID = os.getenv("UZUM_SHOP_ID", "113982").strip()
 
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
@@ -143,7 +154,7 @@ def check_required_env() -> None:
         missing.append("UZUM_TOKEN")
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
-    if not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_CHAT_IDS:
         missing.append("TELEGRAM_CHAT_ID")
     if not UZUM_SHOP_ID:
         missing.append("UZUM_SHOP_ID")
@@ -214,14 +225,20 @@ def get_recent_sales() -> list[dict]:
 
 def send_telegram_message(text: str, chat_id: str | int | None = None) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": str(chat_id or TELEGRAM_CHAT_ID),
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    response = requests.post(url, json=payload, timeout=30)
-    response.raise_for_status()
+
+    # Если chat_id указан — отвечаем только ему.
+    # Если не указан — отправляем всем владельцам из TELEGRAM_CHAT_ID.
+    target_chat_ids = [str(chat_id)] if chat_id else TELEGRAM_CHAT_IDS
+
+    for target_chat_id in target_chat_ids:
+        payload = {
+            "chat_id": target_chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
 
 
 def build_sale_message(item: dict) -> str:
@@ -312,8 +329,8 @@ def parse_days_from_command(text: str, default_days: int) -> int:
 
 
 def handle_command(text: str, chat_id: int) -> None:
-    # Защита: отвечаем только владельцу, чей chat_id указан в переменных окружения.
-    if str(chat_id) != str(TELEGRAM_CHAT_ID):
+    # Защита: отвечаем только владельцам, чьи chat_id указаны в переменной TELEGRAM_CHAT_ID.
+    if str(chat_id) not in TELEGRAM_CHAT_IDS:
         return
 
     cmd = text.strip().split()[0].lower()
@@ -407,6 +424,7 @@ def main() -> None:
 
     print("Uzum Telegram bot запущен.")
     print(f"Shop ID: {UZUM_SHOP_ID}")
+    print(f"Chat IDs: {', '.join(TELEGRAM_CHAT_IDS)}")
     print(f"Интервал проверки продаж: {CHECK_INTERVAL_SECONDS} секунд")
     print(f"Интервал проверки команд: {COMMAND_POLL_INTERVAL_SECONDS} секунд")
 
