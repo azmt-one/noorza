@@ -1,11 +1,17 @@
 import os
 import time
 import sqlite3
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from html import escape
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 
 load_dotenv()
@@ -18,12 +24,31 @@ UZUM_SHOP_ID = os.getenv("UZUM_SHOP_ID", "113982").strip()
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "2"))
 
+# За сколько дней считать команду /balance
+BALANCE_LOOKBACK_DAYS = int(os.getenv("BALANCE_LOOKBACK_DAYS", "30"))
+
+# Как часто бот проверяет команды Telegram
+COMMAND_POLL_INTERVAL_SECONDS = int(os.getenv("COMMAND_POLL_INTERVAL_SECONDS", "5"))
+
 UZUM_URL = "https://api-seller.uzum.uz/api/seller-openapi/v1/finance/orders"
+
+# Для Bothost лучше указать DB_PATH=/app/data/uzum_sales.db
 DB_PATH = os.getenv("DB_PATH", "uzum_sales.db")
-TZ = ZoneInfo("Asia/Tashkent")
+
+try:
+    TZ = ZoneInfo("Asia/Tashkent") if ZoneInfo else timezone(timedelta(hours=5))
+except Exception:
+    TZ = timezone(timedelta(hours=5))
+
+
+def ensure_db_dir() -> None:
+    db_file = Path(DB_PATH)
+    if db_file.parent and str(db_file.parent) not in ("", "."):
+        db_file.parent.mkdir(parents=True, exist_ok=True)
 
 
 def init_db() -> None:
+    ensure_db_dir()
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.cursor()
@@ -34,6 +59,37 @@ def init_db() -> None:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_state(key: str, default: str | None = None) -> str | None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM bot_state WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+    finally:
+        conn.close()
+
+
+def set_state(key: str, value: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -81,36 +137,85 @@ def format_date(ms) -> str:
         return str(ms)
 
 
-def get_sales() -> list[dict]:
-    now = datetime.now(tz=TZ)
-    date_from = int((now - timedelta(days=LOOKBACK_DAYS)).timestamp())
-    date_to = int((now + timedelta(hours=1)).timestamp() * 1000)
+def check_required_env() -> None:
+    missing = []
+    if not UZUM_TOKEN:
+        missing.append("UZUM_TOKEN")
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+    if not UZUM_SHOP_ID:
+        missing.append("UZUM_SHOP_ID")
 
-    params = {
-        "page": 0,
-        "size": 50,
-        "group": "false",
-        "dateFrom": date_from,
-        "dateTo": date_to,
-        "shopIds": UZUM_SHOP_ID,
-    }
+    if missing:
+        raise RuntimeError("Не заполнены переменные окружения: " + ", ".join(missing))
 
-    headers = {
+
+def uzum_headers() -> dict:
+    return {
         # В Swagger написано: Authorization без префикса Bearer
         "Authorization": UZUM_TOKEN,
         "Accept": "application/json",
     }
 
-    response = requests.get(UZUM_URL, headers=headers, params=params, timeout=30)
+
+def get_sales_page(date_from: int, date_to: int, page: int = 0, size: int = 100) -> dict:
+    params = {
+        "page": page,
+        "size": size,
+        "group": "false",
+        # По вашему Swagger сработал вариант: dateFrom в секундах, dateTo в миллисекундах.
+        "dateFrom": date_from,
+        "dateTo": date_to,
+        "shopIds": UZUM_SHOP_ID,
+    }
+
+    response = requests.get(UZUM_URL, headers=uzum_headers(), params=params, timeout=30)
     response.raise_for_status()
-    data = response.json()
-    return data.get("orderItems", [])
+    return response.json()
 
 
-def send_telegram_message(text: str) -> None:
+def get_sales_for_period(start_dt: datetime, end_dt: datetime, max_pages: int = 30) -> list[dict]:
+    date_from = int(start_dt.timestamp())          # секунды
+    date_to = int(end_dt.timestamp() * 1000)       # миллисекунды
+
+    all_items: list[dict] = []
+    page = 0
+    size = 100
+
+    while page < max_pages:
+        data = get_sales_page(date_from, date_to, page=page, size=size)
+        items = data.get("orderItems", [])
+
+        if not items:
+            break
+
+        all_items.extend(items)
+
+        total = data.get("totalElements")
+        if total is not None and len(all_items) >= int(total):
+            break
+
+        if len(items) < size:
+            break
+
+        page += 1
+
+    return all_items
+
+
+def get_recent_sales() -> list[dict]:
+    now = datetime.now(tz=TZ)
+    start = now - timedelta(days=LOOKBACK_DAYS)
+    end = now + timedelta(hours=1)
+    return get_sales_for_period(start, end, max_pages=5)
+
+
+def send_telegram_message(text: str, chat_id: str | int | None = None) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": str(chat_id or TELEGRAM_CHAT_ID),
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -119,9 +224,9 @@ def send_telegram_message(text: str) -> None:
     response.raise_for_status()
 
 
-def build_message(item: dict) -> str:
-    title = item.get("productTitle") or "-"
-    sku = item.get("skuTitle") or "-"
+def build_sale_message(item: dict) -> str:
+    title = escape(str(item.get("productTitle") or "-"))
+    sku = escape(str(item.get("skuTitle") or "-"))
     amount = item.get("amount") or 0
 
     return f"""🛒 <b>Новая продажа Uzum FBO</b>
@@ -137,23 +242,163 @@ def build_message(item: dict) -> str:
 
 <b>ID заказа:</b> {item.get("orderId", "-")}
 <b>ID продажи:</b> {item.get("id", "-")}
-<b>Статус:</b> {item.get("status", "-")}
+<b>Статус:</b> {escape(str(item.get("status", "-")))}
 <b>Дата:</b> {format_date(item.get("date"))}"""
 
 
-def check_required_env() -> None:
-    missing = []
-    if not UZUM_TOKEN:
-        missing.append("UZUM_TOKEN")
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
-    if not UZUM_SHOP_ID:
-        missing.append("UZUM_SHOP_ID")
+def summarize_sales(items: list[dict], title: str) -> str:
+    active_items = [i for i in items if i.get("status") != "CANCELED"]
 
-    if missing:
-        raise RuntimeError("Не заполнены переменные в .env: " + ", ".join(missing))
+    positions = len(active_items)
+    units = sum(int(i.get("amount") or 0) for i in active_items)
+
+    # sellPrice обычно цена за единицу; если amount > 1, умножаем.
+    revenue = sum(int(i.get("sellPrice") or 0) * int(i.get("amount") or 0) for i in active_items)
+
+    commission = sum(int(i.get("commission") or 0) for i in active_items)
+    logistics = sum(int(i.get("logisticDeliveryFee") or 0) for i in active_items)
+    seller_profit = sum(int(i.get("sellerProfit") or 0) for i in active_items)
+    withdrawn_profit = sum(int(i.get("withdrawnProfit") or 0) for i in active_items)
+    to_withdraw = seller_profit - withdrawn_profit
+
+    processing = sum(1 for i in active_items if i.get("status") == "PROCESSING")
+    to_withdraw_count = sum(1 for i in active_items if i.get("status") == "TO_WITHDRAW")
+    returned_units = sum(int(i.get("amountReturns") or 0) for i in active_items)
+
+    return f"""💰 <b>{escape(title)}</b>
+
+<b>Позиций продаж:</b> {positions}
+<b>Кол-во товаров:</b> {units} шт.
+<b>Возвраты:</b> {returned_units} шт.
+
+<b>Выручка:</b> {money(revenue)}
+<b>Комиссия Uzum:</b> {money(commission)}
+<b>Логистика:</b> {money(logistics)}
+
+<b>К выплате всего:</b> {money(seller_profit)}
+<b>Уже выведено:</b> {money(withdrawn_profit)}
+<b>Остаток к выплате:</b> {money(to_withdraw)}
+
+<b>Статусы:</b>
+PROCESSING: {processing}
+TO_WITHDRAW: {to_withdraw_count}
+
+<i>Это расчёт по данным /v1/finance/orders. Если в кабинете Uzum есть корректировки/расходы, итог может отличаться.</i>"""
+
+
+def build_balance_message(days: int = BALANCE_LOOKBACK_DAYS) -> str:
+    now = datetime.now(tz=TZ)
+    start = now - timedelta(days=days)
+    items = get_sales_for_period(start, now + timedelta(hours=1), max_pages=30)
+    return summarize_sales(items, f"Баланс Uzum FBO за {days} дней")
+
+
+def build_today_message() -> str:
+    now = datetime.now(tz=TZ)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    items = get_sales_for_period(start, now + timedelta(hours=1), max_pages=10)
+    return summarize_sales(items, "Продажи Uzum FBO за сегодня")
+
+
+def parse_days_from_command(text: str, default_days: int) -> int:
+    parts = text.strip().split()
+    if len(parts) >= 2:
+        try:
+            days = int(parts[1])
+            return max(1, min(days, 365))
+        except ValueError:
+            return default_days
+    return default_days
+
+
+def handle_command(text: str, chat_id: int) -> None:
+    # Защита: отвечаем только владельцу, чей chat_id указан в переменных окружения.
+    if str(chat_id) != str(TELEGRAM_CHAT_ID):
+        return
+
+    cmd = text.strip().split()[0].lower()
+
+    if cmd in ("/start", "/help"):
+        send_telegram_message(
+            """🤖 <b>Uzum FBO bot работает</b>
+
+Команды:
+/balance — баланс за последние 30 дней
+/balance 7 — баланс за 7 дней
+/today — продажи за сегодня
+/help — список команд""",
+            chat_id,
+        )
+        return
+
+    if cmd == "/balance":
+        days = parse_days_from_command(text, BALANCE_LOOKBACK_DAYS)
+        send_telegram_message("⏳ Считаю баланс...", chat_id)
+        send_telegram_message(build_balance_message(days), chat_id)
+        return
+
+    if cmd == "/today":
+        send_telegram_message("⏳ Считаю продажи за сегодня...", chat_id)
+        send_telegram_message(build_today_message(), chat_id)
+        return
+
+
+def check_telegram_commands() -> None:
+    offset = get_state("telegram_update_offset", "0")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {
+        "offset": int(offset),
+        "timeout": 1,
+    }
+
+    response = requests.get(url, params=params, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+
+    if not data.get("ok"):
+        return
+
+    updates = data.get("result", [])
+    for update in updates:
+        update_id = update.get("update_id")
+        if update_id is not None:
+            set_state("telegram_update_offset", str(int(update_id) + 1))
+
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            continue
+
+        text = message.get("text", "")
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+
+        if text.startswith("/") and chat_id:
+            handle_command(text, int(chat_id))
+
+
+def check_new_sales() -> None:
+    sales = get_recent_sales()
+    sales = sorted(sales, key=lambda x: x.get("date", 0))
+
+    new_count = 0
+
+    for item in sales:
+        sale_id = item.get("id")
+        if not sale_id:
+            continue
+
+        sale_id = int(sale_id)
+
+        if not is_seen(sale_id):
+            send_telegram_message(build_sale_message(item))
+            mark_seen(sale_id, item.get("orderId"))
+            new_count += 1
+
+    print(
+        f"{datetime.now(tz=TZ).strftime('%d.%m.%Y %H:%M:%S')} | "
+        f"Проверено: {len(sales)} | Новых: {new_count}"
+    )
 
 
 def main() -> None:
@@ -162,33 +407,24 @@ def main() -> None:
 
     print("Uzum Telegram bot запущен.")
     print(f"Shop ID: {UZUM_SHOP_ID}")
-    print(f"Интервал проверки: {CHECK_INTERVAL_SECONDS} секунд")
+    print(f"Интервал проверки продаж: {CHECK_INTERVAL_SECONDS} секунд")
+    print(f"Интервал проверки команд: {COMMAND_POLL_INTERVAL_SECONDS} секунд")
+
+    next_sales_check = 0.0
 
     while True:
         try:
-            sales = get_sales()
-            sales = sorted(sales, key=lambda x: x.get("date", 0))
+            check_telegram_commands()
 
-            new_count = 0
-
-            for item in sales:
-                sale_id = item.get("id")
-                if not sale_id:
-                    continue
-
-                sale_id = int(sale_id)
-
-                if not is_seen(sale_id):
-                    send_telegram_message(build_message(item))
-                    mark_seen(sale_id, item.get("orderId"))
-                    new_count += 1
-
-            print(f"{datetime.now(tz=TZ).strftime('%d.%m.%Y %H:%M:%S')} | Проверено: {len(sales)} | Новых: {new_count}")
+            now_ts = time.time()
+            if now_ts >= next_sales_check:
+                check_new_sales()
+                next_sales_check = now_ts + CHECK_INTERVAL_SECONDS
 
         except Exception as e:
             print("Ошибка:", repr(e))
 
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        time.sleep(COMMAND_POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
