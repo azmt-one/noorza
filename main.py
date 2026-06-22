@@ -41,7 +41,11 @@ BALANCE_LOOKBACK_DAYS = int(os.getenv("BALANCE_LOOKBACK_DAYS", "30"))
 # Как часто бот проверяет команды Telegram
 COMMAND_POLL_INTERVAL_SECONDS = int(os.getenv("COMMAND_POLL_INTERVAL_SECONDS", "5"))
 
-UZUM_URL = "https://api-seller.uzum.uz/api/seller-openapi/v1/finance/orders"
+# Остаток, ниже или равно которому товар считается заканчивающимся
+LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "5"))
+
+UZUM_FINANCE_URL = "https://api-seller.uzum.uz/api/seller-openapi/v1/finance/orders"
+UZUM_PRODUCTS_URL = f"https://api-seller.uzum.uz/api/seller-openapi/v1/product/shop/{UZUM_SHOP_ID}"
 
 # Для Bothost лучше указать DB_PATH=/app/data/uzum_sales.db
 DB_PATH = os.getenv("DB_PATH", "uzum_sales.db")
@@ -182,7 +186,7 @@ def get_sales_page(date_from: int, date_to: int, page: int = 0, size: int = 100)
         "shopIds": UZUM_SHOP_ID,
     }
 
-    response = requests.get(UZUM_URL, headers=uzum_headers(), params=params, timeout=30)
+    response = requests.get(UZUM_FINANCE_URL, headers=uzum_headers(), params=params, timeout=30)
     response.raise_for_status()
     return response.json()
 
@@ -221,6 +225,45 @@ def get_recent_sales() -> list[dict]:
     start = now - timedelta(days=LOOKBACK_DAYS)
     end = now + timedelta(hours=1)
     return get_sales_for_period(start, end, max_pages=5)
+
+
+def get_products_page(page: int = 0, size: int = 100) -> dict:
+    params = {
+        "sortBy": "DEFAULT",
+        "order": "ASC",
+        "size": size,
+        "page": page,
+        "filter": "ALL",
+    }
+    response = requests.get(UZUM_PRODUCTS_URL, headers=uzum_headers(), params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_all_products(max_pages: int = 50) -> list[dict]:
+    products: list[dict] = []
+    page = 0
+    size = 100
+
+    while page < max_pages:
+        data = get_products_page(page=page, size=size)
+        items = data.get("productList", [])
+
+        if not items:
+            break
+
+        products.extend(items)
+
+        total = data.get("totalElements") or data.get("total")
+        if total is not None and len(products) >= int(total):
+            break
+
+        if len(items) < size:
+            break
+
+        page += 1
+
+    return products
 
 
 def send_telegram_message(text: str, chat_id: str | int | None = None) -> None:
@@ -317,6 +360,96 @@ def build_today_message() -> str:
     return summarize_sales(items, "Продажи Uzum FBO за сегодня")
 
 
+def product_status_text(product: dict) -> str:
+    status = product.get("status") or {}
+    if isinstance(status, dict):
+        return status.get("title") or status.get("value") or "-"
+    return str(status or "-")
+
+
+def product_available_qty(product: dict) -> int:
+    # По вашему ответу Swagger:
+    # quantityAvailable — доступный остаток
+    # quantityActive — активный остаток
+    # Для команды /stock берём quantityAvailable.
+    return int(product.get("quantityAvailable") or 0)
+
+
+def short_product_name(name: str, limit: int = 60) -> str:
+    name = " ".join(str(name or "-").split())
+    if len(name) <= limit:
+        return name
+    return name[: limit - 1] + "…"
+
+
+def format_stock_line(product: dict, idx: int) -> str:
+    qty = product_available_qty(product)
+    title = short_product_name(product.get("productTitle") or "-")
+    sku = product.get("skuFullTitle") or product.get("skuTitle") or "-"
+    status = product_status_text(product)
+    price = product.get("price")
+
+    return (
+        f"{idx}. <b>{escape(title)}</b>\n"
+        f"SKU: {escape(str(sku))}\n"
+        f"Остаток: <b>{qty} шт.</b> | Статус: {escape(str(status))}"
+        + (f" | Цена: {money(price)}" if price is not None else "")
+    )
+
+
+def split_long_message(text: str, limit: int = 3900) -> list[str]:
+    parts = []
+    current = ""
+
+    for block in text.split("\n\n"):
+        candidate = block if not current else current + "\n\n" + block
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                parts.append(current)
+            current = block
+
+    if current:
+        parts.append(current)
+
+    return parts
+
+
+def build_stock_messages(low_only: bool = False) -> list[str]:
+    products = get_all_products()
+
+    # Показываем неархивные товары. Если нужно, можно убрать этот фильтр.
+    products = [p for p in products if not p.get("archived")]
+
+    products = sorted(products, key=lambda p: (product_available_qty(p), str(p.get("skuFullTitle") or p.get("skuTitle") or "")))
+
+    if low_only:
+        products = [p for p in products if product_available_qty(p) <= LOW_STOCK_THRESHOLD]
+        title = f"⚠️ <b>Товары с остатком ≤ {LOW_STOCK_THRESHOLD} шт.</b>"
+    else:
+        title = "📦 <b>Остатки Uzum FBO</b>"
+
+    if not products:
+        return [title + "\n\nНет товаров для отображения."]
+
+    total_units = sum(product_available_qty(p) for p in products)
+
+    lines = [
+        title,
+        f"Всего SKU: {len(products)}",
+        f"Общий доступный остаток: <b>{total_units} шт.</b>",
+    ]
+
+    for idx, product in enumerate(products[:80], start=1):
+        lines.append(format_stock_line(product, idx))
+
+    if len(products) > 80:
+        lines.append(f"Показаны первые 80 SKU из {len(products)}.")
+
+    return split_long_message("\n\n".join(lines))
+
+
 def parse_days_from_command(text: str, default_days: int) -> int:
     parts = text.strip().split()
     if len(parts) >= 2:
@@ -343,6 +476,8 @@ def handle_command(text: str, chat_id: int) -> None:
 /balance — баланс за последние 30 дней
 /balance 7 — баланс за 7 дней
 /today — продажи за сегодня
+/stock — остатки товаров
+/lowstock — товары, которые заканчиваются
 /help — список команд""",
             chat_id,
         )
@@ -357,6 +492,18 @@ def handle_command(text: str, chat_id: int) -> None:
     if cmd == "/today":
         send_telegram_message("⏳ Считаю продажи за сегодня...", chat_id)
         send_telegram_message(build_today_message(), chat_id)
+        return
+
+    if cmd == "/stock":
+        send_telegram_message("⏳ Получаю остатки...", chat_id)
+        for msg in build_stock_messages(low_only=False):
+            send_telegram_message(msg, chat_id)
+        return
+
+    if cmd == "/lowstock":
+        send_telegram_message("⏳ Проверяю товары, которые заканчиваются...", chat_id)
+        for msg in build_stock_messages(low_only=True):
+            send_telegram_message(msg, chat_id)
         return
 
 
