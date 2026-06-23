@@ -56,6 +56,17 @@ except Exception:
     TZ = timezone(timedelta(hours=5))
 
 
+MAIN_KEYBOARD = {
+    "keyboard": [
+        [{"text": "💰 Баланс"}, {"text": "📊 Сегодня"}],
+        [{"text": "📦 Остатки"}, {"text": "⚠️ Заканчивается"}],
+        [{"text": "🧭 Потерянные"}, {"text": "ℹ️ Помощь"}],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": False,
+}
+
+
 def ensure_db_dir() -> None:
     db_file = Path(DB_PATH)
     if db_file.parent and str(db_file.parent) not in ("", "."):
@@ -266,7 +277,11 @@ def get_all_products(max_pages: int = 50) -> list[dict]:
     return products
 
 
-def send_telegram_message(text: str, chat_id: str | int | None = None) -> None:
+def send_telegram_message(
+    text: str,
+    chat_id: str | int | None = None,
+    reply_markup: dict | None = None,
+) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     # Если chat_id указан — отвечаем только ему.
@@ -280,6 +295,9 @@ def send_telegram_message(text: str, chat_id: str | int | None = None) -> None:
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+
         response = requests.post(url, json=payload, timeout=30)
         response.raise_for_status()
 
@@ -375,6 +393,13 @@ def product_available_qty(product: dict) -> int:
     return int(product.get("quantityAvailable") or 0)
 
 
+
+def product_missing_qty(product: dict) -> int:
+    # По вашему ответу Swagger:
+    # quantityMissing — потерянный товар
+    return int(product.get("quantityMissing") or 0)
+
+
 def short_product_name(name: str, limit: int = 60) -> str:
     name = " ".join(str(name or "-").split())
     if len(name) <= limit:
@@ -450,6 +475,67 @@ def build_stock_messages(low_only: bool = False) -> list[str]:
     return split_long_message("\n\n".join(lines))
 
 
+
+def format_missing_line(product: dict, idx: int) -> str:
+    missing = product_missing_qty(product)
+    available = product_available_qty(product)
+    title = short_product_name(product.get("productTitle") or "-")
+    sku = product.get("skuFullTitle") or product.get("skuTitle") or "-"
+    status = product_status_text(product)
+    price = product.get("price")
+
+    return (
+        f"{idx}. <b>{escape(title)}</b>\n"
+        f"SKU: {escape(str(sku))}\n"
+        f"Потеряно: <b>{missing} шт.</b> | Остаток: {available} шт. | Статус: {escape(str(status))}"
+        + (f" | Цена: {money(price)}" if price is not None else "")
+    )
+
+
+def build_missing_messages() -> list[str]:
+    products = get_all_products()
+    products = [p for p in products if not p.get("archived") and product_missing_qty(p) > 0]
+    products = sorted(products, key=lambda p: product_missing_qty(p), reverse=True)
+
+    title = "🧭 <b>Потерянные товары Uzum FBO</b>"
+
+    if not products:
+        return [title + "\n\nПотерянных товаров не найдено."]
+
+    total_missing = sum(product_missing_qty(p) for p in products)
+    approx_value = sum(product_missing_qty(p) * int(p.get("price") or 0) for p in products)
+
+    lines = [
+        title,
+        f"SKU с потерями: {len(products)}",
+        f"Всего потеряно: <b>{total_missing} шт.</b>",
+        f"Примерная сумма по текущей цене: <b>{money(approx_value)}</b>",
+    ]
+
+    for idx, product in enumerate(products[:80], start=1):
+        lines.append(format_missing_line(product, idx))
+
+    if len(products) > 80:
+        lines.append(f"Показаны первые 80 SKU из {len(products)}.")
+
+    lines.append("<i>Команда использует поле quantityMissing из списка товаров Uzum.</i>")
+
+    return split_long_message("\n\n".join(lines))
+
+
+def normalize_command(text: str) -> str:
+    stripped = text.strip()
+    mapping = {
+        "💰 Баланс": "/balance",
+        "📊 Сегодня": "/today",
+        "📦 Остатки": "/stock",
+        "⚠️ Заканчивается": "/lowstock",
+        "🧭 Потерянные": "/missing",
+        "ℹ️ Помощь": "/help",
+    }
+    return mapping.get(stripped, stripped)
+
+
 def parse_days_from_command(text: str, default_days: int) -> int:
     parts = text.strip().split()
     if len(parts) >= 2:
@@ -466,6 +552,7 @@ def handle_command(text: str, chat_id: int) -> None:
     if str(chat_id) not in TELEGRAM_CHAT_IDS:
         return
 
+    text = normalize_command(text)
     cmd = text.strip().split()[0].lower()
 
     if cmd in ("/start", "/help"):
@@ -473,13 +560,15 @@ def handle_command(text: str, chat_id: int) -> None:
             """🤖 <b>Uzum FBO bot работает</b>
 
 Команды:
-/balance — баланс за последние 30 дней
-/balance 7 — баланс за 7 дней
-/today — продажи за сегодня
-/stock — остатки товаров
-/lowstock — товары, которые заканчиваются
-/help — список команд""",
+💰 /balance — баланс за последние 30 дней
+📆 /balance 7 — баланс за 7 дней
+📊 /today — продажи за сегодня
+📦 /stock — остатки товаров
+⚠️ /lowstock — товары, которые заканчиваются
+🧭 /missing — потерянные товары
+ℹ️ /help — список команд""",
             chat_id,
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
@@ -503,6 +592,13 @@ def handle_command(text: str, chat_id: int) -> None:
     if cmd == "/lowstock":
         send_telegram_message("⏳ Проверяю товары, которые заканчиваются...", chat_id)
         for msg in build_stock_messages(low_only=True):
+            send_telegram_message(msg, chat_id)
+        return
+
+
+    if cmd in ("/missing", "/lost"):
+        send_telegram_message("⏳ Проверяю потерянные товары...", chat_id)
+        for msg in build_missing_messages():
             send_telegram_message(msg, chat_id)
         return
 
@@ -537,7 +633,7 @@ def check_telegram_commands() -> None:
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
 
-        if text.startswith("/") and chat_id:
+        if text and chat_id:
             handle_command(text, int(chat_id))
 
 
